@@ -379,13 +379,8 @@ void xd_calcpos(XDINFO *info, XDINFO *prev, _WORD pmode)
 void xd_screensize(void)
 {
 	_WORD work_out[57];
-	extern void tdlog(const char *);
-	static const char *t1 = "tDk: xd_screensize before vq_extnd\r\n";
-	static const char *t2 = "tDk: xd_screensize after vq_extnd\r\n";
-	tdlog(t1);
 
 	vq_extnd(xd_vhandle, 0, work_out);
-	tdlog(t2);
 
 	xd_screen.g_x = 0;
 	xd_screen.g_y = 0;
