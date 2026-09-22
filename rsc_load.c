@@ -90,7 +90,12 @@ static void xrsrc_hdr2xrsc(RSXHDR *xrsc_header, const RSHDR *header)
 static _ULONG filesize;
 #endif
 
-static int xrsrc_fix(RSHDR *rscHdr)
+#ifdef __arm__
+#define RSC_UNUSED __attribute__((unused))
+#else
+#define RSC_UNUSED
+#endif
+static int RSC_UNUSED xrsrc_fix(RSHDR *rscHdr)
 {
 	RSXHDR xrsc_header;
 	_ULONG UObj;
@@ -441,6 +446,251 @@ static int xrsrc_fix(RSHDR *rscHdr)
 
 /*** ---------------------------------------------------------------------- ***/
 
+#ifdef __arm__
+
+/* RSC files have a fixed, big-endian on-disk layout, even on ARM targets. */
+#define DISK_RSHDR_SIZE 36L
+#define DISK_OBJECT_SIZE 24L
+#define DISK_TEDINFO_SIZE 28L
+#define DISK_ICONBLK_SIZE 34L
+#define DISK_BITBLK_SIZE 14L
+
+typedef struct
+{
+	const unsigned char *data;
+	long size;
+	RSHDR header;
+} DISKRSC;
+
+typedef struct
+{
+	long object, tedinfo, iconblk, bitblk, trindex, frstr, frimg, raw, total;
+} RSCLAYOUT;
+
+static _UWORD disk_uword(const DISKRSC *disk, long offset)
+{
+	const unsigned char *p = disk->data + offset;
+
+	return ((_UWORD)p[0] << 8) | p[1];
+}
+
+static _ULONG disk_ulong(const DISKRSC *disk, long offset)
+{
+	const unsigned char *p = disk->data + offset;
+
+	return ((_ULONG)p[0] << 24) | ((_ULONG)p[1] << 16) | ((_ULONG)p[2] << 8) | p[3];
+}
+
+static int disk_range(const DISKRSC *disk, long offset, long length)
+{
+	return offset >= 0 && length >= 0 && offset <= disk->size && length <= disk->size - offset;
+}
+
+static long align_long(long value)
+{
+	return (value + 3L) & ~3L;
+}
+
+static int layout_add(long *offset, long size)
+{
+	*offset = align_long(*offset);
+	if (size < 0 || *offset > 0x7fffffffL - size)
+		return FALSE;
+	*offset += size;
+	return TRUE;
+}
+
+static int disk_string(const DISKRSC *disk, _ULONG offset)
+{
+	long i;
+
+	if (offset == (_ULONG)-1L)
+		return TRUE;
+	if (offset >= (_ULONG)disk->size)
+		return FALSE;
+	for (i = (long)offset; i < disk->size; i++)
+		if (disk->data[i] == 0)
+			return TRUE;
+	return FALSE;
+}
+
+static int copy_disk_words(_WORD *destination, const DISKRSC *disk, long offset, long words)
+{
+	long i;
+
+	if (words < 0 || !disk_range(disk, offset, words * 2L))
+		return FALSE;
+	for (i = 0; i < words; i++)
+		destination[i] = (_WORD)disk_uword(disk, offset + i * 2L);
+	return TRUE;
+}
+
+static int disk_header(DISKRSC *disk, const void *data, long size)
+{
+	RSHDR *header = &disk->header;
+
+	if (size < DISK_RSHDR_SIZE)
+		return FALSE;
+	disk->data = data;
+	disk->size = size;
+	header->rsh_vrsn = (_WORD)disk_uword(disk, 0);
+	header->rsh_object = (_WORD)disk_uword(disk, 2);
+	header->rsh_tedinfo = (_WORD)disk_uword(disk, 4);
+	header->rsh_iconblk = (_WORD)disk_uword(disk, 6);
+	header->rsh_bitblk = (_WORD)disk_uword(disk, 8);
+	header->rsh_frstr = (_WORD)disk_uword(disk, 10);
+	header->rsh_string = (_WORD)disk_uword(disk, 12);
+	header->rsh_imdata = (_WORD)disk_uword(disk, 14);
+	header->rsh_frimg = (_WORD)disk_uword(disk, 16);
+	header->rsh_trindex = (_WORD)disk_uword(disk, 18);
+	header->rsh_nobs = (_WORD)disk_uword(disk, 20);
+	header->rsh_ntree = (_WORD)disk_uword(disk, 22);
+	header->rsh_nted = (_WORD)disk_uword(disk, 24);
+	header->rsh_nib = (_WORD)disk_uword(disk, 26);
+	header->rsh_nbb = (_WORD)disk_uword(disk, 28);
+	header->rsh_nstring = (_WORD)disk_uword(disk, 30);
+	header->rsh_nimages = (_WORD)disk_uword(disk, 32);
+	header->rsh_rssize = (_WORD)disk_uword(disk, 34);
+	return header->rsh_vrsn == 0 && header->rsh_rssize >= DISK_RSHDR_SIZE
+		&& header->rsh_rssize <= size;
+}
+
+static void set_rsc_globals(void *memory, OBJECT **trees)
+{
+#ifdef __GNUC__
+	memcpy(&aes_global[5], &trees, sizeof(trees));
+	memcpy(&aes_global[7], &memory, sizeof(memory));
+#else
+	_AESrscfile = trees;
+	_AESrscmem = memory;
+#endif
+}
+
+static _WORD xrsrc_load_portable(const void *data, long size)
+{
+	DISKRSC disk;
+	RSCLAYOUT layout;
+	RSHDR *header;
+	unsigned char *image;
+	OBJECT *objects, **trees;
+	TEDINFO *tedinfo;
+	ICONBLK *iconblk;
+	BITBLK *bitblk;
+	char **frstr;
+	BITBLK **frimg;
+	long offset, i, words;
+	_ULONG spec;
+
+	if (!disk_header(&disk, data, size))
+		return FALSE;
+	header = &disk.header;
+	if (header->rsh_nobs < 0 || header->rsh_ntree < 0 || header->rsh_nted < 0
+		|| header->rsh_nib < 0 || header->rsh_nbb < 0 || header->rsh_nstring < 0 || header->rsh_nimages < 0
+		|| !disk_range(&disk, header->rsh_object, (long)header->rsh_nobs * DISK_OBJECT_SIZE)
+		|| !disk_range(&disk, header->rsh_tedinfo, (long)header->rsh_nted * DISK_TEDINFO_SIZE)
+		|| !disk_range(&disk, header->rsh_iconblk, (long)header->rsh_nib * DISK_ICONBLK_SIZE)
+		|| !disk_range(&disk, header->rsh_bitblk, (long)header->rsh_nbb * DISK_BITBLK_SIZE)
+		|| !disk_range(&disk, header->rsh_trindex, (long)header->rsh_ntree * 4L)
+		|| !disk_range(&disk, header->rsh_frstr, (long)header->rsh_nstring * 4L)
+		|| !disk_range(&disk, header->rsh_frimg, (long)header->rsh_nimages * 4L))
+		return FALSE;
+
+	offset = sizeof(RSHDR);
+	layout.object = align_long(offset); if (!layout_add(&offset, (long)header->rsh_nobs * sizeof(OBJECT))) return FALSE;
+	layout.tedinfo = align_long(offset); if (!layout_add(&offset, (long)header->rsh_nted * sizeof(TEDINFO))) return FALSE;
+	layout.iconblk = align_long(offset); if (!layout_add(&offset, (long)header->rsh_nib * sizeof(ICONBLK))) return FALSE;
+	layout.bitblk = align_long(offset); if (!layout_add(&offset, (long)header->rsh_nbb * sizeof(BITBLK))) return FALSE;
+	layout.trindex = align_long(offset); if (!layout_add(&offset, (long)header->rsh_ntree * sizeof(OBJECT *))) return FALSE;
+	layout.frstr = align_long(offset); if (!layout_add(&offset, (long)header->rsh_nstring * sizeof(char *))) return FALSE;
+	layout.frimg = align_long(offset); if (!layout_add(&offset, (long)header->rsh_nimages * sizeof(BITBLK *))) return FALSE;
+	layout.raw = align_long(offset); if (!layout_add(&offset, disk.size)) return FALSE;
+	layout.total = offset;
+	if (layout.total > 0xffffL)
+		return FALSE;
+
+	image = (unsigned char *)Malloc(layout.total);
+	if (image == NULL)
+	{
+		form_error(-(-39) - 31); /* ENOMEM */
+		return FALSE;
+	}
+	memset(image, 0, layout.total);
+	memcpy(image + layout.raw, disk.data, disk.size);
+	header = (RSHDR *)image;
+	*header = disk.header;
+	header->rsh_object = (_WORD)layout.object;
+	header->rsh_tedinfo = (_WORD)layout.tedinfo;
+	header->rsh_iconblk = (_WORD)layout.iconblk;
+	header->rsh_bitblk = (_WORD)layout.bitblk;
+	header->rsh_frstr = (_WORD)layout.frstr;
+	header->rsh_string = (_WORD)(layout.raw + disk.header.rsh_string);
+	header->rsh_imdata = (_WORD)(layout.raw + disk.header.rsh_imdata);
+	header->rsh_frimg = (_WORD)layout.frimg;
+	header->rsh_trindex = (_WORD)layout.trindex;
+	header->rsh_rssize = (_WORD)layout.total;
+	objects = (OBJECT *)(image + layout.object);
+	tedinfo = (TEDINFO *)(image + layout.tedinfo);
+	iconblk = (ICONBLK *)(image + layout.iconblk);
+	bitblk = (BITBLK *)(image + layout.bitblk);
+
+	for (i = 0; i < header->rsh_nted; i++)
+	{
+		offset = disk.header.rsh_tedinfo + i * DISK_TEDINFO_SIZE;
+		spec = disk_ulong(&disk, offset); if (!disk_string(&disk, spec)) goto fail;
+		tedinfo[i].te_ptext = spec == (_ULONG)-1L ? (char *)-1L : (char *)(image + layout.raw + spec);
+		spec = disk_ulong(&disk, offset + 4); if (!disk_string(&disk, spec)) goto fail;
+		tedinfo[i].te_ptmplt = spec == (_ULONG)-1L ? (char *)-1L : (char *)(image + layout.raw + spec);
+		spec = disk_ulong(&disk, offset + 8); if (!disk_string(&disk, spec)) goto fail;
+		tedinfo[i].te_pvalid = spec == (_ULONG)-1L ? (char *)-1L : (char *)(image + layout.raw + spec);
+		tedinfo[i].te_font = (_WORD)disk_uword(&disk, offset + 12); tedinfo[i].te_fontid = (_WORD)disk_uword(&disk, offset + 14);
+		tedinfo[i].te_just = (_WORD)disk_uword(&disk, offset + 16); tedinfo[i].te_color = (_WORD)disk_uword(&disk, offset + 18);
+		tedinfo[i].te_fontsize = (_WORD)disk_uword(&disk, offset + 20); tedinfo[i].te_thickness = (_WORD)disk_uword(&disk, offset + 22);
+		tedinfo[i].te_txtlen = (_WORD)disk_uword(&disk, offset + 24); tedinfo[i].te_tmplen = (_WORD)disk_uword(&disk, offset + 26);
+	}
+	for (i = 0; i < header->rsh_nib; i++)
+	{
+		offset = disk.header.rsh_iconblk + i * DISK_ICONBLK_SIZE;
+		iconblk[i].ib_wicon = (_WORD)disk_uword(&disk, offset + 22); iconblk[i].ib_hicon = (_WORD)disk_uword(&disk, offset + 24);
+		words = ((iconblk[i].ib_wicon + 15L) / 16L) * iconblk[i].ib_hicon;
+		if (iconblk[i].ib_wicon < 0 || iconblk[i].ib_hicon < 0) goto fail;
+		spec = disk_ulong(&disk, offset); if (!copy_disk_words((_WORD *)(image + layout.raw + spec), &disk, spec, words)) goto fail; iconblk[i].ib_pmask = (_WORD *)(image + layout.raw + spec);
+		spec = disk_ulong(&disk, offset + 4); if (!copy_disk_words((_WORD *)(image + layout.raw + spec), &disk, spec, words)) goto fail; iconblk[i].ib_pdata = (_WORD *)(image + layout.raw + spec);
+		spec = disk_ulong(&disk, offset + 8); if (!disk_string(&disk, spec)) goto fail; iconblk[i].ib_ptext = spec == (_ULONG)-1L ? (char *)-1L : (char *)(image + layout.raw + spec);
+		iconblk[i].ib_char = (_WORD)disk_uword(&disk, offset + 12); iconblk[i].ib_xchar = (_WORD)disk_uword(&disk, offset + 14); iconblk[i].ib_ychar = (_WORD)disk_uword(&disk, offset + 16); iconblk[i].ib_xicon = (_WORD)disk_uword(&disk, offset + 18); iconblk[i].ib_yicon = (_WORD)disk_uword(&disk, offset + 20); iconblk[i].ib_xtext = (_WORD)disk_uword(&disk, offset + 26); iconblk[i].ib_ytext = (_WORD)disk_uword(&disk, offset + 28); iconblk[i].ib_wtext = (_WORD)disk_uword(&disk, offset + 30); iconblk[i].ib_htext = (_WORD)disk_uword(&disk, offset + 32);
+	}
+	for (i = 0; i < header->rsh_nbb; i++)
+	{
+		offset = disk.header.rsh_bitblk + i * DISK_BITBLK_SIZE;
+		bitblk[i].bi_wb = (_WORD)disk_uword(&disk, offset + 4); bitblk[i].bi_hl = (_WORD)disk_uword(&disk, offset + 6);
+		words = ((long)bitblk[i].bi_wb * bitblk[i].bi_hl) / 2L;
+		spec = disk_ulong(&disk, offset); if (!copy_disk_words((_WORD *)(image + layout.raw + spec), &disk, spec, words)) goto fail; bitblk[i].bi_pdata = (_WORD *)(image + layout.raw + spec);
+		bitblk[i].bi_x = (_WORD)disk_uword(&disk, offset + 8); bitblk[i].bi_y = (_WORD)disk_uword(&disk, offset + 10); bitblk[i].bi_color = (_WORD)disk_uword(&disk, offset + 12);
+	}
+	for (i = 0; i < header->rsh_nobs; i++)
+	{
+		OBJECT *object = &objects[i];
+		offset = disk.header.rsh_object + i * DISK_OBJECT_SIZE;
+		object->ob_next = (_WORD)disk_uword(&disk, offset); object->ob_head = (_WORD)disk_uword(&disk, offset + 2); object->ob_tail = (_WORD)disk_uword(&disk, offset + 4); object->ob_type = (_UWORD)disk_uword(&disk, offset + 6); object->ob_flags = (_UWORD)disk_uword(&disk, offset + 8); object->ob_state = (_UWORD)disk_uword(&disk, offset + 10);
+		spec = disk_ulong(&disk, offset + 12);
+		switch (object->ob_type & 0xff) { case G_TEXT: case G_BOXTEXT: case G_FTEXT: case G_FBOXTEXT: if (spec < (_ULONG)disk.header.rsh_tedinfo || (spec - disk.header.rsh_tedinfo) % DISK_TEDINFO_SIZE) goto fail; object->ob_spec.tedinfo = &tedinfo[(spec - disk.header.rsh_tedinfo) / DISK_TEDINFO_SIZE]; break; case G_IMAGE: if (spec < (_ULONG)disk.header.rsh_bitblk || (spec - disk.header.rsh_bitblk) % DISK_BITBLK_SIZE) goto fail; object->ob_spec.bitblk = &bitblk[(spec - disk.header.rsh_bitblk) / DISK_BITBLK_SIZE]; break; case G_ICON: if (spec < (_ULONG)disk.header.rsh_iconblk || (spec - disk.header.rsh_iconblk) % DISK_ICONBLK_SIZE) goto fail; object->ob_spec.iconblk = &iconblk[(spec - disk.header.rsh_iconblk) / DISK_ICONBLK_SIZE]; break; case G_STRING: case G_BUTTON: case G_TITLE: if (!disk_string(&disk, spec)) goto fail; object->ob_spec.free_string = spec == (_ULONG)-1L ? (char *)-1L : (char *)(image + layout.raw + spec); break; default: object->ob_spec.index = (_LONG)spec; break; }
+		object->ob_x = (_WORD)disk_uword(&disk, offset + 16); object->ob_y = (_WORD)disk_uword(&disk, offset + 18); object->ob_width = (_WORD)disk_uword(&disk, offset + 20); object->ob_height = (_WORD)disk_uword(&disk, offset + 22);
+	}
+	trees = (OBJECT **)(image + layout.trindex);
+	for (i = 0; i < header->rsh_ntree; i++) { spec = disk_ulong(&disk, disk.header.rsh_trindex + i * 4L); if (spec < (_ULONG)disk.header.rsh_object || (spec - disk.header.rsh_object) % DISK_OBJECT_SIZE || spec >= (_ULONG)(disk.header.rsh_object + (long)header->rsh_nobs * DISK_OBJECT_SIZE)) goto fail; trees[i] = &objects[(spec - disk.header.rsh_object) / DISK_OBJECT_SIZE]; }
+	frstr = (char **)(image + layout.frstr);
+	for (i = 0; i < header->rsh_nstring; i++) { spec = disk_ulong(&disk, disk.header.rsh_frstr + i * 4L); if (!disk_string(&disk, spec)) goto fail; frstr[i] = spec == (_ULONG)-1L ? (char *)-1L : (char *)(image + layout.raw + spec); }
+	frimg = (BITBLK **)(image + layout.frimg);
+	for (i = 0; i < header->rsh_nimages; i++) { spec = disk_ulong(&disk, disk.header.rsh_frimg + i * 4L); if (spec < (_ULONG)disk.header.rsh_bitblk || (spec - disk.header.rsh_bitblk) % DISK_BITBLK_SIZE) goto fail; frimg[i] = &bitblk[(spec - disk.header.rsh_bitblk) / DISK_BITBLK_SIZE]; }
+	rsc_obfix(objects, header->rsh_nobs);
+	set_rsc_globals(image, trees);
+	return TRUE;
+fail:
+	Mfree(image);
+	return FALSE;
+}
+
+#endif /* __arm__ */
+
 _WORD xrsrc_load(const char *fname)
 {
 	int fd;
@@ -472,7 +722,15 @@ _WORD xrsrc_load(const char *fname)
 	filesize = size;
 #endif
 
+#ifdef __arm__
+	{
+		_WORD result = xrsrc_load_portable(useRsc, size);
+		Mfree(useRsc);
+		return result;
+	}
+#else
 	return xrsrc_fix(useRsc);
+#endif
 }
 
 /*** ---------------------------------------------------------------------- ***/
