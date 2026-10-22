@@ -2723,7 +2723,11 @@ bool load_icons(void)
 	/* try to load colour icons */
 	if (colour_icons)
 	{
+#ifdef __arm__
+		if (!xrsrc_load("cicons.rsc"))
+#else
 		if (!rsrc_load("cicons.rsc"))
+#endif
 		{
 			colour_icons = FALSE;
 		} else if (!aes_supports_coloricons())

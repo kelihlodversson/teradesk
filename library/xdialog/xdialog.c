@@ -2299,7 +2299,7 @@ static _WORD appl_x_getinfo(_WORD type, _WORD *out1, _WORD *out2, _WORD *out3, _
  *																	*
  ********************************************************************/
 
-_WORD init_xdialog(_WORD *vdi_handle, void *(*malloc_func) (unsigned long size),
+_WORD init_xdialog(_WORD *vdi_handle, void *(*malloc_func) (size_t size),
 				   void (*free_func) (void *block), const char *prgname, _WORD load_fonts, _WORD *nfonts)
 {
 	_WORD dummy, i;

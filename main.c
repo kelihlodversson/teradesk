@@ -1244,8 +1244,8 @@ static bool init(void)
 }
 
 
-/* 
- * Initialize some stuff related to VDI
+/*
+ * Initialize things related to vdi. Set default font
  */
 
 static void init_vdi(void)
@@ -1740,6 +1740,7 @@ bool wait_to_quit(void)
  * In multittasking environments, proper shutdown is used.
  */
 
+#if !defined(__arm__)
 static void loopcpu(void)
 {
 	for (;;)
@@ -1762,6 +1763,7 @@ static long lobo(void)
 	loopcpu();
 	return 0;
 }
+#endif
 
 
 /* 
@@ -1977,9 +1979,10 @@ int main(void)
 								wd_del_all();	/* remove all windows        */
 								menu_bar(menu, 0);	/* remove menu bar       */
 							}
+						}
 
-							free_icons();
-							regen_desktop(NULL);
+						free_icons();
+						regen_desktop(NULL);
 
 							/* This is a cosmetic clearing of the screen at the end */
 
@@ -1993,18 +1996,17 @@ int main(void)
 								clr_object(&xd_screen, G_BLACK, 4);
 							}
 						}
+
+						/* Release global memory buffer */
+
+						Mfree(global_memory);
+					} else
+					{
+						xform_error(error);
 					}
-
-					/* Release global memory buffer */
-
-					Mfree(global_memory);
-				} else
-				{
-					xform_error(error);
 				}
-			}
 
-			/* Unload loaded fonts */
+				/* Unload loaded fonts */
 
 			if (vq_gdos() != 0)
 				vst_unload_fonts(vdi_handle, 0);
@@ -2088,6 +2090,7 @@ int main(void)
 
 		if (!shutting && !chrez)
 		{
+#if !defined(__arm__)
 			long (*rv) (void);	/* reset vector */
 
 #if _MINT_
@@ -2098,7 +2101,7 @@ int main(void)
 			/* shutopt: 0 = halt/poweroff,  1 = reset,  2 = coldreset */
 
 			Shutdown((long) shutopt);
-			/*
+			/* 
 			 * If we get here, Shutdown did not happen. Try NatFeats instead
 			 */
 			if (shutopt == 0)
@@ -2120,11 +2123,11 @@ int main(void)
 			{
 				/* This is supposed to be a cold reset */
 
-				rv = (long (*)(void)) (*((long *) os_start + 4));	/* pointer to reset handler */
-				memval = 0L;			/* corrupt some variables for a reset */
-				memval2 = 0L;			/* same... */
-				resvector = 0L;			/* same... */
-				resvalid = 0L;			/* same... */
+				rv = (long (*)(void)) (*((long *) os_start + 4));
+				memval = 0L;
+				memval2 = 0L;
+				resvector = 0L;
+				resvalid = 0L;
 			} else
 			{
 				/* 
@@ -2143,6 +2146,8 @@ int main(void)
 			 * Stopping is currently simulated by an endless loop
 			 */
 			Supexec(rv);
+
+#endif /* !__arm__ */
 		}
 	}
 
